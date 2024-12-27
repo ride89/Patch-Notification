@@ -1,0 +1,194 @@
+# This AWS SAM template will set up AWS resources such as event bridge, lambda, 
+# IAM, AWS COnfig. Purpose of this template is to set up an infrastructe in AWS world
+# to sent out notification on scheduled basis that will validate if lambda version 
+# is as per standard or not
+
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: An AWS Serverless Application Model template describing your function.
+
+Parameters:
+  CronExpression:
+    Type: String
+    Description: 'Cron expression for scheduling the Lambda function'
+    Default: 'cron(0 0 1 * ? *)'
+    AllowedPattern: '^cron\(([^ ]+) ([^ ]+) ([^ ]+) ([^ ]+) ([^ ]+) ([^ ]+)\)$'
+    ConstraintDescription: 'Must be a valid cron expression in the format cron(Minutes Hours Day-of-month Month Day-of-week Year)'
+
+  LambdaFunctionName:
+    Type: String
+    Description: 'Name of the Lambda function'
+    Default: 'monthly-scheduled-lambda'
+    MinLength: 1
+    MaxLength: 64
+
+  SenderEmail:
+    Type: String
+    Description: 'Sender email address for sending notifications(Verify this email in SES before deployment)'
+    Default: 'aaggwal@amazon.com'
+
+  RecipientEmail:
+    Type: String
+    Description: 'RECIPIENT Email'
+    Default: 'aaggwal@amazon.com'
+
+Resources:
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'notification schedule for Lambda function'
+      ScheduleExpression: !Ref CronExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ScheduledLambdaFunction.Arn
+          Id: LambdaScheduleTarget
+
+  ScheduledLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import csv
+          from datetime import datetime
+          import os
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.text import MIMEText
+          from email.mime.application import MIMEApplication
+
+          today = datetime.now().strftime("%Y-%m-%d")  # Current day
+          filename = f'/tmp/Non_compliant_resources-{today}.csv' 
+          SENDER = os.environ['SENDER']
+          RECIPIENT = os.environ['RECIPIENT']
+
+
+          def handler(event, context):
+              client = boto3.client("config")
+              rule_name = 'lambda-function-settings-check'
+              response = client.get_compliance_details_by_config_rule(
+                      ConfigRuleName=rule_name,
+                      ComplianceTypes=['COMPLIANT', 'NON_COMPLIANT']
+                  )
+
+              compliance_report = []
+                  
+              for result in response['EvaluationResults']:
+                  if result['ComplianceType'] == 'NON_COMPLIANT':
+                      compliance_entry = {
+                          'resource_name': result.get('EvaluationResultIdentifier').
+                                                  get('EvaluationResultQualifier').
+                                                  get('ResourceId','N/A'),
+                          'compliance_status': result['ComplianceType'],
+                      }
+                  
+                      compliance_report.append(compliance_entry)
+              
+              create_and_save_report(compliance_report)
+              send_email(today,SENDER,RECIPIENT,filename)
+              print('compliance_report',compliance_report)
+
+          def create_and_save_report(non_compliant_resources, filename= filename):
+              
+              fieldnames = non_compliant_resources[0].keys()
+              with open(filename, 'w', newline='') as csvfile:
+                  writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in non_compliant_resources:
+                      writer.writerow(row)
+              print("Report generated " + filename)
+              
+              print('dir',os.listdir("/tmp/"))
+
+          def send_email(today, SENDER, RECIPIENT, filename):
+              # The subject line for the email.
+              SUBJECT = f"AWS Config non-compliant lambda resources report in {today}"
+              ATTACHMENT = filename
+              BODY_TEXT = "Hello,\r\nPlease see the attached file for the list of resources which have been non-compliant for more than 30 days."
+              ses = boto3.client('ses')
+
+              # The HTML body of the email.
+              BODY_HTML = """\
+              <html>
+              <head></head>
+              <body>
+              <p>Hello, please see the attached file for the list of resources which have been non-compliant for more than 30 days</p>
+              </body>
+              </html>
+              """
+              CHARSET = "utf-8"
+              msg = MIMEMultipart('mixed')
+              msg['Subject'] = SUBJECT
+              msg['From'] = SENDER
+              msg['To'] = RECIPIENT
+              msg_body = MIMEMultipart('alternative')
+              textpart = MIMEText(BODY_TEXT.encode(CHARSET), 'plain', CHARSET)
+              htmlpart = MIMEText(BODY_HTML.encode(CHARSET), 'html', CHARSET)
+              msg_body.attach(textpart)
+              msg_body.attach(htmlpart)
+              att = MIMEApplication(open(ATTACHMENT, 'rb').read())
+              att.add_header('Content-Disposition', 'attachment',
+                            filename=os.path.basename(ATTACHMENT))
+              msg.attach(msg_body)
+              msg.attach(att)
+              # Provide the contents of the email.
+              response = ses.send_raw_email(
+                  Source=SENDER,
+                  Destinations=[
+                      RECIPIENT
+                  ],
+                  RawMessage={
+                      'Data': msg.as_string(),
+                  }
+              )
+              print("Email sent! Message ID:"),
+              print(response['MessageId'])
+      Timeout: 300
+      Environment:
+        Variables:
+          SENDER: !Ref SenderEmail
+          RECIPIENT: !Ref RecipientEmail
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ConfigAndSESAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - config:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ses:*
+                Resource: '*'
+
+  # Permission to allow EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScheduledLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
