@@ -1,1 +1,1 @@
-Very basic AWS solution that will send user an notification mechanism detecting and marking non-supported Lambda versions as non-compliant. This solution can be extended to other services also based on user requirement 
+High level working AWS solution that will send user an notification mechanism detecting and marking non-supported Lambda versions as non-compliant. This solution can be extended to other services also based on user requirement. Please make sure sender email id is already verified through SES
